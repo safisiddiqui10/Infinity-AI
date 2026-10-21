@@ -23,17 +23,25 @@ def reset_chat():
     st.session_state["message_history"] = []
 
 
-def add_thread(thread_id):
-    if thread_id not in st.session_state["chat_threads"]:
-        st.session_state["chat_threads"].append(thread_id)
+def add_thread(thread_id, title="New Chat"):
+    # Check if thread_id exists in any of the thread dictionaries
+    if not any(t['id'] == thread_id for t in st.session_state["chat_threads"]):
+        st.session_state["chat_threads"].append({"id": thread_id, "title": title})
 
 
 def load_conversation(thread_id):
     state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
-    return state.values.get("messages", [])
+    messages = state.values.get("messages", [])
+    if not messages:
+        return []
+    # Use the first human message as the title if available
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            return msg.content[:30] + "..." if len(msg.content) > 30 else msg.content, messages
+    return "Past Conversation", messages
 
 
-# ======================= Session Initialization ===================
+# ============================ Session Initialization ===================
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
 
@@ -41,7 +49,23 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = retrieve_all_threads()
+    # Map existing threads from retrieve_all_threads() to the new dictionary format
+    raw_threads = retrieve_all_threads()
+    formatted_threads = []
+    for tid in raw_threads:
+        # Try to get the real title from the first message in the DB
+        try:
+            state = chatbot.get_state(config={"configurable": {"thread_id": tid}})
+            messages = state.values.get("messages", [])
+            title = "Past Conversation"
+            for msg in messages:
+                if isinstance(msg, HumanMessage):
+                    title = msg.content[:30] + "..." if len(msg.content) > 30 else msg.content
+                    break
+            formatted_threads.append({"id": tid, "title": title})
+        except Exception:
+            formatted_threads.append({"id": tid, "title": "Past Conversation"})
+    st.session_state["chat_threads"] = formatted_threads
 
 if "ingested_docs" not in st.session_state:
     st.session_state["ingested_docs"] = {}
@@ -59,6 +83,7 @@ st.sidebar.markdown(f"**Thread ID:** `{thread_key}`")
 
 if st.sidebar.button("New Chat", use_container_width=True):
     reset_chat()
+    st.session_state["message_history"] = []
     st.rerun()
 
 if thread_docs:
@@ -88,24 +113,31 @@ st.sidebar.subheader("Past conversations")
 if not threads:
     st.sidebar.write("No past conversations yet.")
 else:
-    for thread_id in threads:
-        if st.sidebar.button(str(thread_id), key=f"side-thread-{thread_id}"):
-            selected_thread = thread_id
+    for thread in threads:
+        # Use the title for the button, but the ID for the key and logic
+        if st.sidebar.button(thread["title"], key=f"side-thread-{thread['id']}"):
+            selected_thread = thread["id"]
 
-# ============================ Main Layout ========================
-st.title("Infinity AI")
+# ============================ CSS Styling ============================
+st.set_page_config(page_title="Infinity AI", layout="wide")
 
 # Chat area
 for message in st.session_state["message_history"]:
     with st.chat_message(message["role"]):
-        st.text(message["content"])
+        st.markdown(message["content"])
 
 user_input = st.chat_input("Ask about your document or use tools")
 
 if user_input:
+    # Update thread title if it's the first message ("New Chat")
+    current_thread = next((t for t in st.session_state["chat_threads"] if t["id"] == st.session_state["thread_id"]), None)
+    if current_thread and current_thread["title"] == "New Chat":
+        title = user_input[:30] + "..." if len(user_input) > 30 else user_input
+        current_thread["title"] = title
+
     st.session_state["message_history"].append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.text(user_input)
+        st.markdown(user_input)
 
     CONFIG = {
         "configurable": {"thread_id": thread_key},
@@ -160,7 +192,13 @@ st.divider()
 
 if selected_thread:
     st.session_state["thread_id"] = selected_thread
-    messages = load_conversation(selected_thread)
+    result = load_conversation(selected_thread)
+
+    # load_conversation now returns (title, messages) or just messages if not modified
+    if isinstance(result, tuple):
+        title, messages = result
+    else:
+        messages = result
 
     temp_messages = []
     for msg in messages:
