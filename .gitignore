@@ -2,3 +2,6 @@
 /venv
 /Files
 /__pycache__
+/.agents
+/.claude
+/.github
