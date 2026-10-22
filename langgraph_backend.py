@@ -28,14 +28,42 @@ embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-
 # -------------------
 # 2. PDF retriever store (per thread)
 # -------------------
+INDEX_DIR = "faiss_indexes"
+os.makedirs(INDEX_DIR, exist_ok=True)
+
 _THREAD_RETRIEVERS: Dict[str, Any] = {}
 _THREAD_METADATA: Dict[str, dict] = {}
 
 
 def _get_retriever(thread_id: Optional[str]):
-    """Fetch the retriever for a thread if available."""
-    if thread_id and thread_id in _THREAD_RETRIEVERS:
-        return _THREAD_RETRIEVERS[thread_id]
+    """Fetch the retriever for a thread if available, loading from disk if necessary."""
+    if not thread_id:
+        return None
+
+    tid_str = str(thread_id)
+
+    # 1. Check if already in memory
+    if tid_str in _THREAD_RETRIEVERS:
+        return _THREAD_RETRIEVERS[tid_str]
+
+    # 2. Check if it exists on disk
+    index_path = os.path.join(INDEX_DIR, tid_str)
+    if os.path.exists(index_path):
+        try:
+            # Load the vector store from disk
+            vector_store = FAISS.load_local(
+                index_path,
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+            retriever = vector_store.as_retriever(
+                search_type="similarity", search_kwargs={"k": 4}
+            )
+            _THREAD_RETRIEVERS[tid_str] = retriever
+            return retriever
+        except Exception as e:
+            print(f"Error loading FAISS index for thread {tid_str}: {e}")
+
     return None
 
 
@@ -62,9 +90,15 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
         chunks = splitter.split_documents(docs)
 
         vector_store = FAISS.from_documents(chunks, embeddings)
+
+        # Save index to disk
+        index_path = os.path.join(INDEX_DIR, str(thread_id))
+        vector_store.save_local(index_path)
+
         retriever = vector_store.as_retriever(
             search_type="similarity", search_kwargs={"k": 4}
         )
+
 
         _THREAD_RETRIEVERS[str(thread_id)] = retriever
         _THREAD_METADATA[str(thread_id)] = {
@@ -125,15 +159,29 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 @tool
 def get_stock_price(symbol: str) -> dict:
     """
-    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
+    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')
     using Alpha Vantage with API key in the URL.
     """
-    url = (
-        "https://www.alphavantage.co/query"
-        f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey=C9PE94QUEW9VWGFM"
-    )
-    r = requests.get(url)
-    return r.json()
+    if not symbol or not isinstance(symbol, str) or len(symbol) > 10:
+        return {"error": "Invalid stock symbol provided. Please provide a valid ticker (e.g., 'AAPL')."}
+
+    try:
+        url = (
+            "https://www.alphavantage.co/query"
+            f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={os.getenv('ALPHA_VANTAGE_API_KEY')}"
+        )
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if not data or "Global Quote" not in data or not data["Global Quote"]:
+            return {"error": f"No stock data found for symbol: {symbol}"}
+
+        return data
+    except requests.exceptions.Timeout:
+        return {"error": "The stock price request timed out. Please try again later."}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"An error occurred while fetching stock data: {str(e)}"}
 
 
 @tool
@@ -142,6 +190,12 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
     Retrieve relevant information from the uploaded PDF for this chat thread.
     Always include the thread_id when calling this tool.
     """
+    if not query or not isinstance(query, str):
+        return {"error": "A valid search query string is required."}
+
+    if not thread_id:
+        return {"error": "thread_id is required to retrieve documents for a specific chat."}
+
     retriever = _get_retriever(thread_id)
     if retriever is None:
         return {
@@ -149,16 +203,19 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
             "query": query,
         }
 
-    result = retriever.invoke(query)
-    context = [doc.page_content for doc in result]
-    metadata = [doc.metadata for doc in result]
+    try:
+        result = retriever.invoke(query)
+        context = [doc.page_content for doc in result]
+        metadata = [doc.metadata for doc in result]
 
-    return {
-        "query": query,
-        "context": context,
-        "metadata": metadata,
-        "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
-    }
+        return {
+            "query": query,
+            "context": context,
+            "metadata": metadata,
+            "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
+        }
+    except Exception as e:
+        return {"error": f"An error occurred during document retrieval: {str(e)}"}
 
 
 tools = [search_tool, get_stock_price, calculator, rag_tool]

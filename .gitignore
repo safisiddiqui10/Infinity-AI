@@ -4,4 +4,4 @@
 /__pycache__
 /.agents
 /.claude
-/.github
+/.github.env
